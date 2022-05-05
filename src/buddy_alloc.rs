@@ -6,6 +6,11 @@
 
 #![allow(clippy::needless_range_loop)]
 
+use core::{
+    alloc::{AllocError, Allocator, Layout},
+    ptr::NonNull,
+};
+
 const OOM_MSG: &str = "requires more memory space to initialize BuddyAlloc";
 const LEAF_ALIGN_ERROR_MSG: &str = "leaf size must be aligned to 16 bytes";
 /// required to align to 16 bytes, since Node takes 16 bytes on 64-bits machine.
@@ -299,63 +304,6 @@ impl BuddyAlloc {
         self.unavailable = end_addr - base_addr;
     }
 
-    pub fn malloc(&mut self, nbytes: usize) -> *mut u8 {
-        let fk = first_up_k(nbytes, 1 << self.leaf2base);
-        let mut k = match (fk..self.entries_size).find(|&k| !Node::is_empty(self.entry(k).free)) {
-            Some(k) => k,
-            None => return core::ptr::null_mut(),
-        };
-        let p: *mut u8 = Node::pop(self.entry(k).free) as *mut u8;
-        bit_set(self.entry(k).alloc, self.block_index(k, p));
-        while k > fk {
-            let q: *mut u8 = (p as usize + block_size_2base(k - 1, self.leaf2base)) as *mut u8;
-            bit_set(self.entry(k).split, self.block_index(k, p));
-            let parent_entry = self.entry(k - 1);
-            bit_set(parent_entry.alloc, self.block_index(k - 1, p));
-            debug_assert!(!bit_isset(parent_entry.alloc, self.block_index(k - 1, q)));
-            Node::push(parent_entry.free, q);
-            k -= 1;
-        }
-        debug_assert_eq!(
-            ((p as usize) >> self.leaf2base) << self.leaf2base,
-            p as usize,
-            "misalignment"
-        );
-        p
-    }
-
-    pub fn free(&mut self, mut p: *mut u8) {
-        let mut k = self.find_k_for_p(p);
-        while k < (self.entries_size - 1) {
-            let block_index = self.block_index(k, p);
-            let entry = self.entry(k);
-            bit_clear(entry.alloc, block_index);
-            let is_head = block_index & 1 == 0;
-            let buddy = if is_head {
-                block_index + 1
-            } else {
-                block_index - 1
-            };
-            if bit_isset(entry.alloc, buddy) {
-                break;
-            }
-            // merge buddy since its free
-            // 1. clear split of k + 1
-            // 2. set p to the address of merged block
-            // 3. repeat for k = k + 1 until reach MAX_K
-            // 4. push p back to k entry free list
-            let q = self.block_addr(k, buddy);
-            Node::remove(q as *mut Node);
-            if !is_head {
-                p = q as *mut u8;
-            }
-            bit_clear(self.entry(k + 1).split, self.block_index(k + 1, p));
-            k += 1;
-        }
-        debug_assert!(!bit_isset(self.entry(k).alloc, self.block_index(k, p)));
-        Node::push(self.entry(k).free, p);
-    }
-
     /// available bytes
     pub fn available_bytes(&self) -> usize {
         self.end_addr - self.unavailable - self.base_addr
@@ -395,5 +343,71 @@ impl BuddyAlloc {
         // equal to: i * block_size_2base(k, self.leaf2base);
         let n = (i << k) << self.leaf2base;
         self.base_addr + n
+    }
+}
+
+unsafe impl Allocator for BuddyAlloc {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        let nbytes = layout.size();
+        // TODO: alignment!
+        let fk = first_up_k(nbytes, 1 << self.leaf2base);
+        let mut k = match (fk..self.entries_size).find(|&k| !Node::is_empty(self.entry(k).free)) {
+            Some(k) => k,
+            None => return Err(AllocError),
+        };
+        let p: *mut u8 = Node::pop(self.entry(k).free) as *mut u8;
+        bit_set(self.entry(k).alloc, self.block_index(k, p));
+        while k > fk {
+            let q: *mut u8 = (p as usize + block_size_2base(k - 1, self.leaf2base)) as *mut u8;
+            bit_set(self.entry(k).split, self.block_index(k, p));
+            let parent_entry = self.entry(k - 1);
+            bit_set(parent_entry.alloc, self.block_index(k - 1, p));
+            debug_assert!(!bit_isset(parent_entry.alloc, self.block_index(k - 1, q)));
+            Node::push(parent_entry.free, q);
+            k -= 1;
+        }
+        debug_assert_eq!(
+            ((p as usize) >> self.leaf2base) << self.leaf2base,
+            p as usize,
+            "misalignment"
+        );
+
+        Ok(NonNull::slice_from_raw_parts(
+            unsafe { NonNull::new_unchecked(p) },
+            layout.size(),
+        ))
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, _layout: Layout) {
+        let mut p = ptr.as_ptr();
+        let mut k = self.find_k_for_p(p);
+        while k < (self.entries_size - 1) {
+            let block_index = self.block_index(k, p);
+            let entry = self.entry(k);
+            bit_clear(entry.alloc, block_index);
+            let is_head = block_index & 1 == 0;
+            let buddy = if is_head {
+                block_index + 1
+            } else {
+                block_index - 1
+            };
+            if bit_isset(entry.alloc, buddy) {
+                break;
+            }
+            // merge buddy since its free
+            // 1. clear split of k + 1
+            // 2. set p to the address of merged block
+            // 3. repeat for k = k + 1 until reach MAX_K
+            // 4. push p back to k entry free list
+            let q = self.block_addr(k, buddy);
+            Node::remove(q as *mut Node);
+            if !is_head {
+                p = q as *mut u8;
+            }
+            bit_clear(self.entry(k + 1).split, self.block_index(k + 1, p));
+            k += 1;
+        }
+        debug_assert!(!bit_isset(self.entry(k).alloc, self.block_index(k, p)));
+        Node::push(self.entry(k).free, p);
     }
 }

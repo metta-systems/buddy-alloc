@@ -1,7 +1,12 @@
+#![feature(allocator_api)]
+
 #[macro_use]
 extern crate criterion;
 
-use criterion::{Criterion, Throughput};
+use {
+    criterion::{Criterion, Throughput},
+    std::alloc::{Allocator, Layout},
+};
 
 use buddy_alloc::buddy_alloc::{BuddyAlloc, BuddyAllocParam};
 
@@ -20,18 +25,21 @@ fn with_allocator<F: FnOnce(BuddyAlloc)>(f: F) {
 
 fn bench_alloc(allocator: &mut BuddyAlloc, alloc_size: usize) {
     for _i in 0..(ALLOC_SIZE / alloc_size) {
-        allocator.malloc(alloc_size);
+        allocator
+            .allocate(Layout::from_size_align(alloc_size, 1).unwrap())
+            .unwrap();
     }
 }
 
 fn bench_alloc_then_free(allocator: &mut BuddyAlloc, alloc_size: usize) {
     let count = ALLOC_SIZE / alloc_size;
+    let layout = Layout::from_size_align(alloc_size, 1).unwrap();
     let mut ptrs = Vec::with_capacity(count);
     for _i in 0..count {
-        ptrs.push(allocator.malloc(alloc_size));
+        ptrs.push(allocator.allocate(layout).unwrap());
     }
     for _i in 0..count {
-        allocator.free(ptrs.pop().unwrap());
+        unsafe { allocator.deallocate(ptrs.pop().unwrap().cast(), layout) };
     }
 }
 

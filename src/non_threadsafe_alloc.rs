@@ -1,10 +1,17 @@
 //! NonThreadSafeAlloc
 //! An allocator that does not support thread-safe
 
-use crate::buddy_alloc::{BuddyAlloc, BuddyAllocParam};
-use crate::freelist_alloc::{FreelistAlloc, FreelistAllocParam, BLOCK_SIZE};
-use core::alloc::{GlobalAlloc, Layout};
-use core::cell::RefCell;
+use {
+    crate::{
+        buddy_alloc::{BuddyAlloc, BuddyAllocParam},
+        freelist_alloc::{FreelistAlloc, FreelistAllocParam, BLOCK_SIZE},
+    },
+    core::{
+        alloc::{AllocError, Allocator, GlobalAlloc, Layout},
+        cell::RefCell,
+        ptr::NonNull,
+    },
+};
 
 /// Use buddy allocator if request bytes is large than this,
 /// otherwise use freelist allocator
@@ -50,34 +57,49 @@ impl NonThreadsafeAlloc {
     }
 }
 
-unsafe impl GlobalAlloc for NonThreadsafeAlloc {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let bytes = layout.size();
+// ==== Allocator api ====
+unsafe impl Allocator for NonThreadsafeAlloc {
+    /// Allocate a memory block from the pool.
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         // use BuddyAlloc if size is larger than MAX_FREELIST_ALLOC_SIZE
-        if bytes > MAX_FREELIST_ALLOC_SIZE {
-            self.fetch_buddy_alloc(|alloc| alloc.malloc(bytes))
+        if layout.size() > MAX_FREELIST_ALLOC_SIZE {
+            unsafe { self.fetch_buddy_alloc(|alloc| alloc.allocate(layout)) }
         } else {
             // try freelist alloc, fallback to BuddyAlloc if failed
-            let mut p = self.fetch_freelist_alloc(|alloc| alloc.malloc(bytes));
-            if p.is_null() {
-                p = self.fetch_buddy_alloc(|alloc| alloc.malloc(bytes));
+            unsafe {
+                self.fetch_freelist_alloc(|alloc| alloc.allocate(layout))
+                    .or_else(|_| self.fetch_buddy_alloc(|alloc| alloc.allocate(layout)))
             }
-            p
         }
     }
-    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
         let freed = self.fetch_freelist_alloc(|alloc| {
-            if alloc.contains_ptr(ptr) {
-                alloc.free(ptr);
+            if alloc.contains_ptr(ptr.as_ptr()) {
+                alloc.deallocate(ptr, layout);
                 true
             } else {
                 false
             }
         });
         if !freed {
-            self.fetch_buddy_alloc(|alloc| alloc.free(ptr));
+            self.fetch_buddy_alloc(|alloc| alloc.deallocate(ptr, layout));
         }
     }
 }
 
+// ==== GlobalAlloc api ====
 unsafe impl Sync for NonThreadsafeAlloc {}
+
+unsafe impl GlobalAlloc for NonThreadsafeAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        self.allocate(layout)
+            .map_or(core::ptr::null_mut(), |p| p.as_mut_ptr())
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if !ptr.is_null() {
+            self.deallocate(NonNull::new_unchecked(ptr), layout)
+        }
+    }
+}
