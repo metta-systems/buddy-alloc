@@ -1,7 +1,7 @@
 [package]
 name = "buddy-alloc"
 version = "0.6.0"
-authors = ["jjy <jjyruby@gmail.com>"]
+authors = ["jjy <jjyruby@gmail.com>", "Berkus Decker <berkus+crates@metta.systems"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/jjyr/buddy-alloc"
