@@ -1,7 +1,13 @@
-//! Fast allocator
+//! Freelist allocator
 //! Optimized for fixed small memory block.
 
-// Fix size 64 Bytes
+use core::{
+    alloc::{AllocError, Allocator, Layout},
+    cell::RefCell,
+    ptr::NonNull,
+};
+
+/// Fixed size 64 Bytes, can't allocate more in one allocation.
 pub const BLOCK_SIZE: usize = 64;
 
 struct Node {
@@ -49,32 +55,32 @@ impl Node {
 }
 
 #[derive(Clone, Copy)]
-pub struct FastAllocParam {
+pub struct FreelistAllocParam {
     base_addr: *const u8,
     len: usize,
 }
 
-impl FastAllocParam {
+impl FreelistAllocParam {
     pub const fn new(base_addr: *const u8, len: usize) -> Self {
-        FastAllocParam { base_addr, len }
+        FreelistAllocParam { base_addr, len }
     }
 }
 
-pub struct FastAlloc {
+pub struct FreelistAlloc {
     /// memory start addr
     base_addr: usize,
     /// memory end addr
     end_addr: usize,
-    free: *mut Node,
+    free: RefCell<*mut Node>,
 }
 
-impl FastAlloc {
+impl FreelistAlloc {
     /// # Safety
     ///
-    /// The `base_addr..(base_addr + len)` must be allocated before using,
+    /// The `base_addr..(base_addr + len)` must be allocated before use,
     /// and must guarantee no others write to the memory range, otherwise behavior is undefined.
-    pub unsafe fn new(param: FastAllocParam) -> Self {
-        let FastAllocParam { base_addr, len } = param;
+    pub unsafe fn new(param: FreelistAllocParam) -> Self {
+        let FreelistAllocParam { base_addr, len } = param;
         let base_addr = base_addr as usize;
         let end_addr = base_addr + len;
         debug_assert_eq!(len % BLOCK_SIZE, 0);
@@ -91,10 +97,10 @@ impl FastAlloc {
             Node::push(free, addr as *mut u8);
         }
 
-        FastAlloc {
+        FreelistAlloc {
             base_addr,
             end_addr,
-            free,
+            free: RefCell::new(free),
         }
     }
 
@@ -102,28 +108,39 @@ impl FastAlloc {
         let addr = p as usize;
         addr >= self.base_addr && addr < self.end_addr
     }
+}
 
-    pub fn malloc(&mut self, nbytes: usize) -> *mut u8 {
-        if nbytes > BLOCK_SIZE || self.free.is_null() {
-            return core::ptr::null_mut();
+unsafe impl Allocator for FreelistAlloc {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        let nbytes = layout.size();
+        // TODO: alignment!
+        if nbytes > BLOCK_SIZE || self.free.borrow().is_null() {
+            return Err(AllocError);
         }
 
-        let is_last = Node::is_empty(self.free);
-        let p = Node::pop(self.free) as *mut u8;
+        let is_last = Node::is_empty(self.free.borrow().cast_const());
+        let p = Node::pop(*self.free.borrow_mut()) as *mut u8;
         if is_last {
-            self.free = core::ptr::null_mut();
+            self.free.replace(core::ptr::null_mut());
         }
-        p
+        Ok(NonNull::slice_from_raw_parts(
+            unsafe { NonNull::new_unchecked(p) },
+            layout.size(),
+        ))
     }
 
-    pub fn free(&mut self, p: *mut u8) {
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, _layout: Layout) {
+        let p = ptr.as_ptr();
         debug_assert!(self.contains_ptr(p));
-        if self.free.is_null() {
+        let f = self.free.borrow();
+        if f.is_null() {
             let n = p.cast();
             Node::init(n);
-            self.free = n;
+            drop(f);
+            self.free.replace(n);
         } else {
-            Node::push(self.free, p);
+            drop(f);
+            Node::push(*self.free.borrow_mut(), p);
         }
     }
 }
