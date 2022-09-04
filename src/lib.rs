@@ -1,7 +1,6 @@
 #![cfg_attr(not(test), no_std)]
 #![feature(allocator_api)]
 #![feature(nonnull_slice_from_raw_parts)]
-#![feature(ptr_const_cast)]
 #![feature(slice_ptr_get)]
 
 pub mod buddy_alloc;

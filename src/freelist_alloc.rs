@@ -118,7 +118,7 @@ unsafe impl Allocator for FreelistAlloc {
             return Err(AllocError);
         }
 
-        let is_last = Node::is_empty(self.free.borrow().as_const());
+        let is_last = Node::is_empty(self.free.borrow().cast_const());
         let p = Node::pop(*self.free.borrow_mut()) as *mut u8;
         if is_last {
             self.free.replace(core::ptr::null_mut());
